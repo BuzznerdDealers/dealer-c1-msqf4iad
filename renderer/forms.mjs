@@ -49,6 +49,39 @@ function fieldName(field) {
   return field.name || field.id;
 }
 
+/**
+ * A form's or a field's analytics annotations, as they reach the browser.
+ *
+ * Namespaced by provider id — `{"shift-digital": {"formType": "Get a Quote"}}` —
+ * because the values are each provider's own restricted vocabulary. Two
+ * providers wanting a different form type for the same form is normal, and a
+ * flat bag would have one of them silently overwrite the other.
+ *
+ * The renderer does not interpret any of it. It copies string leaves and drops
+ * everything else: an object or an array would serialise into an event property
+ * no provider can read, and shipping `[object Object]` as a form type is worse
+ * than shipping nothing.
+ */
+function analyticsBag(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  const out = {};
+  let any = false;
+  for (const [providerId, values] of Object.entries(source)) {
+    if (!values || typeof values !== 'object' || Array.isArray(values)) continue;
+    const kept = {};
+    let keptAny = false;
+    for (const [key, value] of Object.entries(values)) {
+      if (typeof value !== 'string' || value === '') continue;
+      kept[key] = value;
+      keptAny = true;
+    }
+    if (!keptAny) continue;
+    out[providerId] = kept;
+    any = true;
+  }
+  return any ? JSON.stringify(out) : null;
+}
+
 function renderChoices(field, name) {
   const options = field.options || [];
   if (field.type === 'dropdown') {
@@ -79,6 +112,10 @@ ${join(
 
 function renderField(field) {
   const name = fieldName(field);
+  // What this field reports as, per provider. Absent when the dealer has not
+  // mapped it, and the runtime then falls back to the input's own name rather
+  // than guessing at a vocabulary it does not have.
+  const analyticsName = analyticsBag(field.analytics);
   const label = `<label class="bz-label" id="${esc(field.id)}-l" for="${esc(field.id)}">${esc(
     field.label,
   )}${field.required ? ' <span class="bz-req" aria-hidden="true">*</span>' : ''}</label>`;
@@ -108,6 +145,7 @@ function renderField(field) {
 
   return `<div class="bz-field"${attrs({
     'data-bz-field': field.id,
+    'data-bz-field-analytics': analyticsName,
     'data-bz-logic': logic ? JSON.stringify(logic) : null,
     hidden: logic ? true : null,
   })}>${label}${control}${field.help ? `<p class="bz-help">${esc(field.help)}</p>` : ''}</div>`;
@@ -137,6 +175,18 @@ export function renderForm(form, ctx) {
     id: `form-${form.id}`,
     'data-bz-form': form.id,
     'data-bz-success': form.successMessage || 'Thanks — we will be in touch shortly.',
+    'data-bz-redirect': form.redirectUrl || null,
+    // The form's analytics annotations ride on the element rather than being
+    // looked up by the runtime: the runtime has no access to the form
+    // definition, and a second copy of the mapping is a second thing to get
+    // wrong. The bag is opaque here and in the runtime — a provider's adapter
+    // is the only thing that knows what its keys mean, or that one of them is
+    // required and needs a default.
+    'data-bz-analytics': analyticsBag(form.analytics),
+    // The vehicle a form on or near a VDP is bound to, baked in at build time
+    // from the page's product context. Not hidden inputs: a hidden field is a
+    // field, and a bot can rewrite one. The server re-resolves it anyway.
+    'data-bz-vehicle': form.vehicle ? JSON.stringify(form.vehicle) : null,
     ...tagAttrs('form', form.intent || `form-${form.id}`),
   })}>
   <p class="bz-form__t">${esc(form.name || 'Contact us')}</p>

@@ -208,6 +208,40 @@
     });
   }
 
+  function emit(name, detail) {
+    try {
+      document.dispatchEvent(new CustomEvent(name, { detail: detail }));
+    } catch (e) {
+      /* A browser without CustomEvent still submits the form. */
+    }
+  }
+
+  /* The consent checkbox is an explicit permission to contact, so a ticked box
+   * is `in-explicit`. A form with no consent control at all is `in-implicit`:
+   * the visitor asked to be contacted by filling it in, which is what that
+   * value means. An unticked box on a form that has one is `out`. */
+  function optInFor(form) {
+    var box = form.querySelector('input[name="consent"]');
+    if (!box) return 'in-implicit';
+    return box.checked ? 'in-explicit' : 'out';
+  }
+
+  /* Preferred contact method, when the form asked. Never inferred from which
+   * fields the visitor happened to fill in — a phone number is not a request
+   * to be phoned. */
+  function prefContactFor(data) {
+    var value = data.get('prefContact') || data.get('preferred_contact');
+    if (!value) return null;
+    value = String(value).toLowerCase();
+    return /phone|call/.test(value)
+      ? 'phone'
+      : /email/.test(value)
+        ? 'email'
+        : /text|sms/.test(value)
+          ? 'text'
+          : 'other';
+  }
+
   function submitForm(form) {
     var status = form.querySelector('.bz-form__status');
     var button = form.querySelector('button[type=submit]');
@@ -232,6 +266,21 @@
             status.setAttribute('data-state', 'ok');
             status.textContent = form.getAttribute('data-bz-success') || 'Thanks — we will be in touch.';
           }
+          /* Announced rather than tracked here: this file knows the lead landed
+           * and what id it was given, and analytics.js knows how to report it.
+           * Keeping the two apart means a dealer without the analytics runtime
+           * still gets working forms. The event carries the server's leadId, so
+           * the tag reports a reference that matches a row. */
+          emit('bz:form:submitted', {
+            form: form,
+            leadId: (res && res.leadId) || null,
+            formOptIn: optInFor(form),
+            prefContact: prefContactFor(data),
+          });
+          /* Only after the lead is safely recorded, and only after the event is
+           * dispatched — navigating first would lose both. */
+          var redirect = form.getAttribute('data-bz-redirect') || (res && res.redirectUrl);
+          if (redirect) setTimeout(function () { location.assign(redirect); }, 150);
           return;
         }
         throw new Error((res && res.message) || 'Submission failed');
@@ -242,6 +291,7 @@
           status.setAttribute('data-state', 'error');
           status.textContent = err.message || 'Something went wrong. Please try again.';
         }
+        emit('bz:form:error', { form: form, message: err.message || 'Submission failed' });
       });
   }
 

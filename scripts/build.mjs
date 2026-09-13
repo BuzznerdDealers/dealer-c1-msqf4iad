@@ -15,6 +15,7 @@
 //
 // Run: node scripts/build.mjs  ->  dist/
 
+import { missingIdentity as missingAnalyticsIdentity } from '../renderer/analytics.mjs';
 import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +50,14 @@ const readJsonIf = (p, fallback) => (existsSync(p) ? readJson(p) : fallback);
 const readText = (p, fallback = '') => (existsSync(p) ? readFileSync(p, 'utf8') : fallback);
 
 const config = readJson(join(ROOT, 'dealer.config.json'));
+
+/* The providers this dealer has enabled, baked by the platform at publish time.
+ *
+ * A dealer in no programme has no such file, and that is the normal state — not
+ * a misconfiguration to warn about. `platform/` is platform-owned and outside
+ * the builder's writable path set, so a dealer cannot edit or delete what a
+ * provider needs from the Design screen. */
+config.platformAnalytics = readJsonIf(join(ROOT, 'platform', 'analytics.json'), null);
 const tokens = readJson(join(SITE, 'tokens.json'));
 const menus = readJson(join(SITE, 'menus.json'));
 const pages = readJson(join(SITE, 'pages.json'));
@@ -338,6 +347,7 @@ const resetCss = readText(join(SITE, 'reset.css'));
 // widget.
 const blocksCss = readText(join(RENDERER, 'blocks.css')) + (customCss ? `\n${customCss}\n` : '');
 const widgetsJs = readText(join(RENDERER, 'client', 'widgets.js'));
+const analyticsJs = readText(join(RENDERER, 'client', 'analytics.js'));
 
 /* ------------------------------------------------------------------ writing */
 
@@ -347,6 +357,40 @@ function write(rel, contents) {
   writeFileSync(out, contents);
 }
 
+/* The placeholder guard.
+ *
+ * A site that tags with `REPLACE_CLIENT_ID` reports to nobody and looks exactly
+ * like a site that is tagged correctly — the tag fires, the network request goes
+ * out, and the omission is found during certification rather than before it. So
+ * a production build refuses while any enabled provider still has a placeholder
+ * in a setting it declared required, which is what turns an unanswered
+ * onboarding email from a blocker into data entry.
+ *
+ * Which settings those are is data: the platform copies each provider's
+ * `requiredForProduction` into `platform/analytics.json`, so this guard keeps
+ * working for a provider that did not exist when it was written.
+ *
+ * Preview and development builds go through: the whole point of modelling these
+ * as configuration is that everything else can be built and reviewed first. */
+const IS_PRODUCTION =
+  process.env.VERCEL_ENV === 'production' || process.env.BZ_DEPLOY_ENV === 'production';
+const missingIdentity = missingAnalyticsIdentity(config);
+if (IS_PRODUCTION && missingIdentity.length) {
+  console.error(
+    `\n  Analytics is enabled for this dealer but ${missingIdentity.join(', ')} ` +
+      `${missingIdentity.length === 1 ? 'is' : 'are'} still a placeholder.\n` +
+      '  A production site tagged with a REPLACE_ value reports to nobody and looks tagged.\n' +
+      "  Set the issued values on the dealer's Analytics providers screen, or turn the provider off.\n",
+  );
+  process.exit(1);
+}
+if (missingIdentity.length) {
+  console.warn(
+    `  warn: analytics identity is incomplete (${missingIdentity.join(', ')}). ` +
+      'This builds, but a production deployment will be refused.',
+  );
+}
+
 mkdirSync(DIST, { recursive: true });
 write('styles/tokens.css', tokensCss);
 write('styles/reset.css', resetCss);
@@ -354,6 +398,7 @@ write('styles/blocks.css', blocksCss);
 write('styles/chrome.css', chromeCss);
 write('scripts/chrome.js', chromeJs);
 write('scripts/widgets.js', widgetsJs);
+write('scripts/analytics.js', analyticsJs);
 
 /* -------------------------------------------------------------------- pages */
 // status: published -> emitted, indexed, in sitemap + llms.txt
@@ -395,6 +440,10 @@ const blogSettings = readJsonIf(join(BLOG, 'settings.json'), {
   title: 'News',
   description: '',
 });
+/* Every post and the index report the same page kind, so posts do not carry the
+ * field and there is nothing to get wrong across however many a dealer writes.
+ * Authorable, because a provider's vocabulary may call it something else. */
+const POST_PAGE_TYPE = blogSettings.pageType || 'Blog';
 const blogBase = String(blogSettings.basePath || '/blog').replace(/\/$/, '');
 const posts = [];
 if (blogSettings.enabled && existsSync(join(BLOG, 'posts'))) {
@@ -446,6 +495,7 @@ for (const p of pages) {
       ogImage: p.seo && p.seo.ogImage,
       noindex,
       tokenScopes: p.tokenScope ? [p.tokenScope] : [],
+      analyticsPage: { pageType: p.pageType || null },
     }),
   );
   emitted.push({ ...p, status, noindex, template: rendered.resolved.template?.id ?? null });
@@ -466,6 +516,10 @@ write('partials/chrome.css', chromeCss);
 write('partials/blocks.css', blocksCss);
 write('partials/chrome.js', chromeJs);
 write('partials/widgets.js', widgetsJs);
+// The storefront serves its own head, so it takes the loader from its root
+// route and only needs the runtime here — one script, two mount points, so the
+// brand site and /store/* share a session rather than measuring two visits.
+write('partials/analytics.js', analyticsJs);
 write('partials/reset.css', resetCss);
 write('partials/tokens.css', tokensCss);
 write('partials/fonts.txt', FONTS_HREF);
@@ -520,6 +574,7 @@ if (blogSettings.enabled && posts.length) {
           pageJs: [...(rendered.scripts ?? []), ...(postJs ? [postJs] : [])],
           ogImage: post.coverImage,
           noindex: false,
+          analyticsPage: { pageType: POST_PAGE_TYPE },
         }),
       );
     }
@@ -537,6 +592,7 @@ if (blogSettings.enabled && posts.length) {
         title: settings.title,
         description: settings.description || config.seo.defaultDescription,
         canonical: config.url + base,
+        analyticsPage: { pageType: POST_PAGE_TYPE },
         bodyHtml: `<section class="bz-block"><div class="bz-container">
   <h1>${settings.title}</h1>
   <p class="bz-lede">${settings.description || ''}</p>

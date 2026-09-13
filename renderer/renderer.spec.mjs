@@ -1680,3 +1680,299 @@ test('a menu can be drawn as a mega panel', () => {
   assert.match(html, /bz-navlabel">Showroom/);
   assert.match(html, /href="\/volvo"/);
 });
+
+/* -------------------------------------------------- analytics providers */
+
+import { analyticsConfig, analyticsHead, missingIdentity } from './analytics.mjs';
+import { renderShell } from './shell.mjs';
+import { isValidPageType, pageTypeOptions } from './analytics-vocab.mjs';
+
+/** A config carrying the baked provider file, as `scripts/build.mjs` assembles it. */
+const withProviders = (providers, runtimeVersion = '4.11.0') => ({
+  name: 'Example',
+  url: 'https://example.com',
+  favicon: '/favicon.svg',
+  channelToken: 'ct',
+  seo: { locale: 'en_US', themeColor: '#000', defaultTitle: 'X', defaultDescription: 'Y', ogImage: '/og.jpg' },
+  business: { type: 'AutoDealer', legalName: 'Example', phone: '+1-800-555-0100' },
+  analytics: { loaderUrl: null, loaderVersion: runtimeVersion },
+  platformAnalytics: providers === null ? null : { runtimeVersion, providers },
+});
+
+/* One provider, shaped the way a real descriptor bakes: a queueing stub, an
+ * ordered create call, a page call carrying the page facts and this dealer's
+ * settings, then the call that sends the first page view. */
+const oneProvider = {
+  id: 'demo',
+  adapterUrl: 'https://assets.example.com/analytics/demo-1.0.0.js',
+  settings: { clientId: 'C1', dealerBrand: ['International', 'IC Bus'], blank: '' },
+  requiredForProduction: ['clientId', 'retailerId'],
+  bootstrap: {
+    globalName: 'dm',
+    script: 'https://vendor.example.com/dm.js?containerId=C1',
+    calls: [['create', 'C1', 'R1', 'P1']],
+    pageCall: ['set', 'page'],
+    readyCall: ['send', 'pageview'],
+    pageKeys: { pageType: 'pageType', vehicle: 'vehicleDetails' },
+  },
+};
+
+test('a dealer with no providers gets no analytics head at all', () => {
+  assert.equal(analyticsHead(withProviders(null), { pageType: 'Home' }), '');
+  assert.equal(analyticsHead(withProviders([]), { pageType: 'Home' }), '');
+  assert.deepEqual(analyticsConfig(withProviders(null)).providers, []);
+});
+
+test('the head emits the config blob, then each provider bootstrap', () => {
+  const html = analyticsHead(withProviders([oneProvider]), { pageType: 'Home' });
+  const blobAt = html.indexOf('window.__BZ_ANALYTICS__=');
+  const stubAt = html.indexOf('window.dm=window.dm||');
+  assert.ok(blobAt >= 0 && stubAt > blobAt, 'the deferred runtime must be able to read its config without a fetch');
+});
+
+test('the bootstrap keeps document order: create, then page, then pageview', () => {
+  const html = analyticsHead(withProviders([oneProvider]), { pageType: 'Home' });
+  const create = html.indexOf('dm("create"');
+  const page = html.indexOf('dm("set","page"');
+  const view = html.indexOf('dm("send","pageview")');
+  assert.ok(create >= 0 && page > create && view > page, html);
+  // Ordering is document order, not JS timing: the page facts are in the data
+  // layer before the pageview by construction, with nothing to race.
+});
+
+test('page facts are renamed per provider, and a fact it does not name is not sent', () => {
+  const html = analyticsHead(withProviders([oneProvider]), {
+    pageType: 'Vehicle Details',
+    vehicle: { vin: '1XYZ' },
+    errorCode: '404',
+  });
+  assert.match(html, /"pageType":"Vehicle Details"/);
+  assert.match(html, /"vehicleDetails":\{"vin":"1XYZ"\}/);
+  assert.equal(html.includes('404'), false, 'errorCode has no entry in pageKeys, so it is not sent');
+});
+
+test('array settings are pipe-delimited and blanks are omitted from the page call', () => {
+  const html = analyticsHead(withProviders([oneProvider]), { pageType: 'Parts' });
+  // Scoped to the bootstrap: the config blob ahead of it carries the settings
+  // raw, because an adapter may want the array rather than the vendor's
+  // flattening of it.
+  const bootstrap = html.slice(html.indexOf('window.dm='));
+  assert.match(bootstrap, /"dealerBrand":"International\|IC Bus"/);
+  assert.equal(bootstrap.includes('"blank"'), false);
+});
+
+test('a value containing </script> cannot end the tag early', () => {
+  const provider = { ...oneProvider, settings: { pageBrand: '</script><script>alert(1)' } };
+  const html = analyticsHead(withProviders([provider]), {});
+  assert.equal(html.includes('</script><script>alert(1)'), false);
+  assert.match(html, /<\\\/script>/);
+});
+
+test('a globalName that is not a bare identifier emits nothing', () => {
+  // The global is written into executable code. Anything else would be an
+  // injection point in the one file whose job is to avoid one.
+  for (const globalName of ['a-b', 'window.x', 'a()', '']) {
+    const provider = { ...oneProvider, bootstrap: { ...oneProvider.bootstrap, globalName } };
+    const html = analyticsHead(withProviders([provider]), {});
+    assert.equal(html.includes('vendor.example.com'), false, globalName);
+  }
+});
+
+test('the config blob tells the runtime which providers already sent a page view', () => {
+  const noReady = { ...oneProvider, id: 'quiet', bootstrap: { ...oneProvider.bootstrap, readyCall: undefined } };
+  const html = analyticsHead(withProviders([oneProvider, noReady]), { pageType: 'Home' });
+  const blob = JSON.parse(html.slice(html.indexOf('{', html.indexOf('__BZ_ANALYTICS__')), html.indexOf(';</script>')));
+  assert.equal(blob.providers.find((p) => p.id === 'demo').bootstrapped, true);
+  assert.equal(blob.providers.find((p) => p.id === 'quiet').bootstrapped, false);
+});
+
+test('the placeholder guard names every unset value, per provider', () => {
+  const provider = { ...oneProvider, settings: { clientId: 'REPLACE_SD_CLIENT_ID' } };
+  assert.deepEqual(missingIdentity(withProviders([provider])), ['demo.clientId', 'demo.retailerId']);
+  assert.deepEqual(missingIdentity(withProviders(null)), [], 'no providers means nothing to check');
+  const complete = { ...oneProvider, settings: { clientId: 'C', retailerId: 'R' } };
+  assert.deepEqual(missingIdentity(withProviders([complete])), []);
+});
+
+test('a page kind is unconstrained until a provider constrains it', () => {
+  assert.equal(isValidPageType('Anything at all', null), true);
+  assert.equal(isValidPageType('', null), false);
+  assert.deepEqual(pageTypeOptions(null), []);
+
+  const vocab = { pageTypes: ['Home', 'Vehicle Details'] };
+  assert.equal(isValidPageType('Vehicle Details', vocab), true);
+  // Case-sensitive: a value differing only in case is one the provider rejects,
+  // and accepting it here moves the failure to where nobody is looking.
+  assert.equal(isValidPageType('vehicle details', vocab), false);
+  assert.equal(isValidPageType('Nonsense', vocab), false);
+  assert.deepEqual(pageTypeOptions(vocab), ['Home', 'Vehicle Details']);
+});
+
+/** The rendered value of one attribute, with the renderer's escaping undone. */
+const attrJson = (html, name) => {
+  const match = new RegExp(`${name}="([^"]*)"`).exec(html);
+  assert.ok(match, `${name} is not on the element`);
+  return JSON.parse(match[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+};
+
+test('a form carries its analytics annotations, namespaced per provider', () => {
+  const html = renderForm(
+    {
+      id: 'quote',
+      name: 'Request a quote',
+      analytics: {
+        'shift-digital': { formType: 'Get a Quote', leadType: 'lead' },
+        ga4: { formType: 'quote_request' },
+      },
+      redirectUrl: '/thank-you',
+      fields: [
+        { id: 'email', type: 'email', label: 'Email', analytics: { 'shift-digital': { formFieldName: 'emailaddress' } } },
+      ],
+    },
+    { storefrontPrefix: 'store' },
+  );
+  // Two providers wanting a different form type for the same form is normal.
+  // A flat bag would have one of them silently overwrite the other.
+  assert.deepEqual(attrJson(html, 'data-bz-analytics'), {
+    'shift-digital': { formType: 'Get a Quote', leadType: 'lead' },
+    ga4: { formType: 'quote_request' },
+  });
+  assert.deepEqual(attrJson(html, 'data-bz-field-analytics'), {
+    'shift-digital': { formFieldName: 'emailaddress' },
+  });
+  assert.match(html, /data-bz-redirect="\/thank-you"/);
+});
+
+test('a form with no analytics mapping renders, and claims nothing', () => {
+  const html = renderForm({ id: 'x', name: 'X', fields: [{ id: 'a', type: 'text', label: 'A' }] }, {});
+  assert.equal(/data-bz-analytics/.test(html), false);
+  assert.equal(/data-bz-field-analytics/.test(html), false);
+  // No default: a provider that requires a form type supplies it in its own
+  // adapter, which is the only place that knows the value is required.
+});
+
+test('only string leaves survive, and an empty provider is not claimed', () => {
+  const html = renderForm(
+    {
+      id: 'x',
+      name: 'X',
+      analytics: {
+        'shift-digital': { formType: 'Other', codes: ['a'], n: 3, blank: '' },
+        ga4: {},
+        broken: 'not an object',
+      },
+      fields: [],
+    },
+    {},
+  );
+  assert.deepEqual(attrJson(html, 'data-bz-analytics'), { 'shift-digital': { formType: 'Other' } });
+  assert.equal(html.includes('object Object'), false);
+});
+
+test('the renderer version is a page fact, named by whoever wants it', () => {
+  const wants = { ...oneProvider, bootstrap: { ...oneProvider.bootstrap, pageKeys: { runtimeVersion: 'siteTechnologyVersion' } } };
+  const html = analyticsHead(withProviders([wants], '4.11.0'), { pageType: 'Home' });
+  assert.match(html, /"siteTechnologyVersion":"4.11.0"/);
+  // Never a literal, or it drifts per dealer the moment a renderer ships.
+  const doesNot = analyticsHead(withProviders([oneProvider], '4.11.0'), { pageType: 'Home' });
+  assert.equal(doesNot.slice(doesNot.indexOf('window.dm=')).includes('4.11.0'), false);
+});
+
+test('the shell puts the whole analytics burst in the head, in order', () => {
+  // The function-level ordering tests above prove `analyticsHead` composes the
+  // burst correctly. This proves the shell actually emits it inside <head> —
+  // the guide requires head placement for complete page-view capture, and a
+  // burst that landed in the body would still pass every test above.
+  const html = renderShell({
+    config: withProviders([oneProvider]),
+    fontsHref: '',
+    analyticsPage: { pageType: 'Home' },
+    chrome: {},
+    title: 'T',
+    description: 'D',
+    canonical: 'https://example.com/',
+    bodyHtml: '<main></main>',
+    storefrontPrefix: 'store',
+  });
+  const head = html.slice(0, html.indexOf('</head>'));
+  const at = (needle) => {
+    const i = head.indexOf(needle);
+    assert.notEqual(i, -1, `${needle} is not in <head>`);
+    return i;
+  };
+  const order = [
+    'window.__BZ_ANALYTICS__=',
+    'window.dm=window.dm||',
+    'dm("create"',
+    'dm("set","page"',
+    'dm("send","pageview")',
+    'vendor.example.com/dm.js',
+  ].map(at);
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'the head burst is out of order');
+});
+
+test('a page-kind value map translates the platform words and lets authored ones through', () => {
+  // The storefront derives a page kind from the route and knows no provider, so
+  // it emits the platform's own word. A brand-site page kind is authored by a
+  // human against the provider's own vocabulary and must reach it untouched.
+  const mapping = {
+    ...oneProvider,
+    bootstrap: {
+      ...oneProvider.bootstrap,
+      pageValues: { pageType: { listing: 'Vehicle Listing', detail: 'Vehicle Details' } },
+    },
+  };
+  const derived = analyticsHead(withProviders([mapping]), { pageType: 'listing' });
+  assert.match(derived.slice(derived.indexOf('window.dm=')), /"pageType":"Vehicle Listing"/);
+
+  const authored = analyticsHead(withProviders([mapping]), { pageType: 'Finance' });
+  assert.match(authored.slice(authored.indexOf('window.dm=')), /"pageType":"Finance"/);
+});
+
+test('an empty object is an absent fact, not a fact whose value is {}', () => {
+  const html = analyticsHead(withProviders([oneProvider]), { pageType: 'Home', vehicle: {} });
+  // A vendor receiving `vehicleDetails: {}` reads it as a page that has a
+  // vehicle with nothing known about it.
+  assert.equal(html.includes('vehicleDetails'), false);
+});
+
+/* A provider whose global is a plain array the vendor's script drains, rather
+ * than a function that queues its own arguments — Google Tag Manager's
+ * `dataLayer`. Emitting a function stub for one of these breaks the tag
+ * outright: `gtm.js` calls `.push`, and a function has none. */
+const queueProvider = {
+  id: 'tagmanager',
+  adapterUrl: 'https://assets.example.com/analytics/tagmanager-1.0.0.js',
+  settings: { containerId: 'TM-ABC1234' },
+  requiredForProduction: ['containerId'],
+  bootstrap: {
+    globalName: 'layer',
+    globalKind: 'queue',
+    script: 'https://vendor.example.com/tm.js?id=TM-ABC1234',
+    calls: [[{ 'tm.start': 'container-start', event: 'tm.js' }]],
+    pageCall: [{ event: 'page_view' }],
+    pageKeys: { pageType: 'page_type' },
+  },
+};
+
+test('a queue global is an array, and its calls are pushes', () => {
+  const html = analyticsHead(withProviders([queueProvider]), { pageType: 'Home' });
+  assert.match(html, /window\.layer=window\.layer\|\|\[\];/);
+  assert.equal(html.includes('function(){(layer.q'), false, 'a function stub has no .push');
+  assert.match(html, /layer\.push\(\{"tm\.start":"container-start","event":"tm\.js"\}\);/);
+});
+
+test('a queue provider gets one merged object, not an argument list', () => {
+  const html = analyticsHead(withProviders([queueProvider]), { pageType: 'Home' });
+  // What the vendor calls the event, with the page facts merged into it. That
+  // is the whole shape a data layer takes.
+  assert.match(html, /layer\.push\(\{"event":"page_view","page_type":"Home","containerId":"TM-ABC1234"\}\);/);
+});
+
+test('a provider with no readyCall is not marked as having sent its page view', () => {
+  // Its page call *is* its page view, so the runtime must keep sending page
+  // views to it — otherwise it never sees a client-side navigation.
+  const html = analyticsHead(withProviders([queueProvider]), { pageType: 'Home' });
+  const blob = JSON.parse(html.slice(html.indexOf('{', html.indexOf('__BZ_ANALYTICS__')), html.indexOf(';</script>')));
+  assert.equal(blob.providers[0].bootstrapped, false);
+});

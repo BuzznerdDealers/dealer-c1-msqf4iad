@@ -28,6 +28,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isValidPageType, pageTypeOptions } from '../renderer/analytics-vocab.mjs';
 import {
   CONDITION_TYPES,
   MENU_ITEM_TYPES,
@@ -71,6 +72,28 @@ const readJson = (path) => {
 const rel = (path) => relative(ROOT, path);
 const listJson = (dir) =>
   existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.json')).sort() : [];
+
+/* The closed vocabularies this repo must author against.
+ *
+ * Baked into `platform/analytics.json` at publish, alongside the providers
+ * themselves, from whichever ones the dealer enabled. It lives with them rather
+ * than in `renderer/` for two reasons: `renderer/` is overwritten wholesale by
+ * the platform-file sync, which would delete a per-dealer file on the next
+ * publish; and the vocabularies are a fact about this dealer's providers, so
+ * they belong in the same file, written by the same bake, as the providers.
+ *
+ * Absent is the normal case and means nothing is constrained — not that
+ * validation is degraded. A dealer with no providers, or whose providers take
+ * free text, authors any page kind they like. A malformed file is treated the
+ * same as an absent one: refusing to validate a whole repo because a generated
+ * file is broken would block a dealer from fixing something they cannot edit. */
+const analyticsVocab = (() => {
+  const path = join(ROOT, 'platform', 'analytics.json');
+  if (!existsSync(path)) return null;
+  const { value } = readJson(path);
+  const vocab = value?.vocabularies;
+  return vocab && typeof vocab === 'object' ? vocab : null;
+})();
 
 /* ------------------------------------------------------- custom widgets first */
 // Registered before any document is validated: a page placing this site's own
@@ -195,6 +218,32 @@ if (!existsSync(pagesPath)) {
             );
           }
         }
+        // Checked against the vocabulary the platform baked for whichever
+        // providers this dealer enabled, and unconstrained when there is none —
+        // a dealer in no programme authors whatever word describes the page.
+        //
+        // Optional either way, and a note rather than a failure when absent.
+        // Every existing dealer repo predates the field, and
+        // `syncPlatformFiles()` reaches those repos on publish rather than on a
+        // schedule — a repo at renderer 4.7.0 against 4.9.0 is the live proof
+        // that they drift. Making absence a failure today would break the next
+        // save in every unsynced repo.
+        if (page?.pageType !== undefined && !isValidPageType(page.pageType, analyticsVocab)) {
+          const allowed = pageTypeOptions(analyticsVocab);
+          fail(
+            'site/pages.json',
+            `${at}.pageType`,
+            `"${page.pageType}" is not a page kind any enabled analytics provider accepts`,
+            `Values are case sensitive. One of: ${allowed.join(', ')}.`,
+          );
+        } else if (page?.pageType === undefined) {
+          note(
+            'site/pages.json',
+            `"${page?.slug ?? at}" has no pageType, so analytics cannot tell what kind ` +
+              'of page it is. Set one in Pages → page settings.',
+          );
+        }
+
         if (page?.dir) pages.push(page);
       }
     }
@@ -267,6 +316,7 @@ for (const file of listJson(join(SITE, 'templates'))) {
   for (const issue of errors) fail(rel(path), issue.path, issue.message);
   for (const issue of warnings) note(rel(path), `${issue.path}: ${issue.message}`);
   reportUnknownTypes(rel(path), parsed.nodes);
+  reportHandTaggedMarkup(rel(path), parsed.nodes);
   checkReferences(rel(path), parsed.nodes);
   reportStackedSiblings(rel(path), parsed.nodes);
   reportRepeatedShapes(rel(path), parsed.nodes);
@@ -302,6 +352,7 @@ for (const page of pages) {
   for (const issue of errors) fail(rel(path), issue.path, issue.message);
   for (const issue of warnings) note(rel(path), `${issue.path}: ${issue.message}`);
   reportUnknownTypes(rel(path), value?.nodes ?? []);
+  reportHandTaggedMarkup(rel(path), value?.nodes ?? []);
   checkReferences(rel(path), value?.nodes ?? []);
   reportStackedSiblings(rel(path), value?.nodes ?? []);
   reportRepeatedShapes(rel(path), value?.nodes ?? []);
@@ -332,6 +383,7 @@ for (const file of listJson(join(SITE, 'sections'))) {
   for (const issue of errors) fail(rel(path), issue.path, issue.message);
   for (const issue of warnings) note(rel(path), `${issue.path}: ${issue.message}`);
   reportUnknownTypes(rel(path), value?.nodes ?? []);
+  reportHandTaggedMarkup(rel(path), value?.nodes ?? []);
   checkReferences(rel(path), value?.nodes ?? []);
   reportStackedSiblings(rel(path), value?.nodes ?? []);
   reportRepeatedShapes(rel(path), value?.nodes ?? []);
@@ -354,6 +406,7 @@ for (const file of listJson(join(SITE, 'blog', 'posts'))) {
     const { errors } = validateDocument(value);
     for (const issue of errors) fail(rel(path), issue.path, issue.message);
     reportUnknownTypes(rel(path), value.nodes ?? value.blocks ?? []);
+    reportHandTaggedMarkup(rel(path), value.nodes ?? value.blocks ?? []);
   }
 }
 
@@ -484,6 +537,45 @@ function eachNode(nodes, visit, path = 'nodes') {
  * quietest one in the system: the renderer skips an unknown type with a warning,
  * so the page builds, deploys and simply has a hole where the section was.
  */
+/**
+ * Certified analytics events must never originate from `customHtml` or a coded
+ * widget.
+ *
+ * The block model's whole tagging guarantee rests on the renderer emitting
+ * `data-bz-el` / `data-bz-intent` structurally, so the AI cannot strip an
+ * attribute it never authors. `customHtml` and coded widgets are the two places
+ * an author writes markup directly, and markup written by hand carries whatever
+ * attributes the author remembered — which is how a certified site quietly stops
+ * reporting a CTA that somebody rebuilt as a hand-written link.
+ *
+ * They are not banned outright: both render, both are legitimate for markup no
+ * block expresses, and the build already warns that `customHtml` is not
+ * auto-tagged. What is refused is markup that *claims* to be a tagged element,
+ * because that claim is what makes the loss invisible — the element looks
+ * instrumented and reports nothing anybody maintains.
+ */
+function reportHandTaggedMarkup(file, nodes) {
+  // Every analytics attribute the renderer emits structurally. Widened rather
+  // than enumerated per provider: a hand-written `data-bz-` analytics attribute
+  // is the problem whatever its name, and a list that lags the renderer would
+  // pass exactly the ones nobody thought of.
+  const TAGGED = /\bdata-bz-(el|intent|cta|analytics|field-analytics|link-type|department|brochure|asset|vehicle)\s*=/;
+  eachNode(nodes, (node, path) => {
+    if (node?.type !== 'customHtml') return;
+    const html = node?.props?.html;
+    if (typeof html === 'string' && TAGGED.test(html)) {
+      fail(
+        file,
+        path,
+        'hand-writes an analytics attribute inside customHtml',
+        'Certified events come from real blocks, which emit these attributes structurally. ' +
+          'Hand-written ones survive until the next AI edit and then silently stop reporting — ' +
+          'use a buttons, menu, form or link block instead.',
+      );
+    }
+  });
+}
+
 function reportUnknownTypes(file, nodes) {
   eachNode(nodes, (node, at) => {
     if (!node.type) {

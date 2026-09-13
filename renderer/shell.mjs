@@ -3,6 +3,7 @@
 // the same markup the published page gets, rather than approximating it.
 
 import { esc } from './html.mjs';
+import { analyticsHead } from './analytics.mjs';
 
 /**
  * LocalBusiness node for the dealership. Injected once per page by the shell —
@@ -56,6 +57,16 @@ export function analyticsTag(config) {
 export function renderShell({
   config,
   fontsHref,
+  /**
+   * The page's analytics facts, in platform names: `pageType`, `errorCode` on a
+   * 404, and `vehicle` on a detail page.
+   *
+   * A page kind is authored in `site/pages.json` rather than derived from the
+   * path, because a path cannot tell one custom page from another and a wrong
+   * restricted value is indistinguishable from a right one. What each fact is
+   * *called* on the wire is the provider's business, via its `pageKeys`.
+   */
+  analyticsPage = {},
   /**
    * Self-hosted woff2 URLs worth preloading, from `fontPreloads(tokens)`.
    * `crossorigin` is not optional even for a same-origin file: font fetches are
@@ -152,7 +163,10 @@ ${fontTags}
 <link rel="stylesheet" href="/styles/blocks.css" />
 <link rel="stylesheet" href="/styles/chrome.css" />
 ${custom.css ? `<style data-bz-custom>${custom.css}</style>\n` : ''}<style>${pageCss}</style>
-<script type="application/ld+json">${businessJsonLd(config)}</script>${analyticsTag(config)}${extraHead}${custom.headEnd ? `\n${custom.headEnd}` : ''}
+<script type="application/ld+json">${businessJsonLd(config)}</script>${analyticsTag(config)}${analyticsHead(
+  config,
+  analyticsPage,
+)}${extraHead}${custom.headEnd ? `\n${custom.headEnd}` : ''}
 </head>
 <body data-bz-prefix="${esc(storefrontPrefix)}">${custom.bodyStart ? `\n${custom.bodyStart}` : ''}
 ${chrome.header || ''}
@@ -161,7 +175,8 @@ ${bodyHtml}
 </main>${custom.beforeFooter ? `\n${custom.beforeFooter}` : ''}
 ${chrome.footer || ''}
 <script src="/scripts/chrome.js" defer></script>
-<script src="/scripts/widgets.js" defer></script>${custom.hasJs ? `\n<script src="/scripts/custom.js" defer></script>` : ''}${scriptTags}${custom.bodyEnd ? `\n${custom.bodyEnd}` : ''}
+<script src="/scripts/widgets.js" defer></script>
+<script src="/scripts/analytics.js" defer></script>${custom.hasJs ? `\n<script src="/scripts/custom.js" defer></script>` : ''}${scriptTags}${custom.bodyEnd ? `\n${custom.bodyEnd}` : ''}
 </body>
 </html>
 `;
